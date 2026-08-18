@@ -23,7 +23,6 @@ st.markdown("""
 # ==========================================
 
 class ShinEngine:
-    """Extrae el margen implícito de la casa (Overround) y el factor de información Z."""
     @staticmethod
     def deoverround(odds_list):
         odds = np.array(odds_list, dtype=float)
@@ -41,7 +40,6 @@ class ShinEngine:
         return p_clean / np.sum(p_clean), z_opt
 
 class MonteCarloEngine:
-    """Simulador Bivariado de 50,000 iteraciones con Distribución Binomial Negativa."""
     def __init__(self, simulations=50000, phi=1.15):
         self.simulations = simulations
         self.phi = phi
@@ -54,7 +52,6 @@ class MonteCarloEngine:
         sim_a = np.random.negative_binomial(n_a, p_a, self.simulations)
         totals = sim_h + sim_a
 
-        # Matriz de marcadores exactos (hasta 5x5)
         matrix = np.zeros((6, 6))
         for h, a in zip(sim_h, sim_a):
             if h < 6 and a < 6:
@@ -62,21 +59,22 @@ class MonteCarloEngine:
         matrix = (matrix / self.simulations) * 100
 
         return {
-            'totals': totals, 'sim_h': sim_h, 'sim_a': sim_a,
+            'totals': totals,
             'matrix': matrix,
-            'get_prob_over': lambda line: np.mean(totals > line),
-            'get_prob_under': lambda line: np.mean(totals < line)
+            'p_over': lambda line: np.mean(totals > line),
+            'p_under': lambda line: np.mean(totals < line),
+            'p_exact': lambda line: np.mean(totals == line)
         }
 
 # ==========================================
-# 2. CONEXIÓN API EN TIEMPO REAL
+# 2. CONFIGURACIÓN Y API
 # ==========================================
 
 st.sidebar.header("🔑 Panel de Control")
 api_key = st.sidebar.text_input("API Key (The-Odds-API):", value="", type="password")
 region = st.sidebar.selectbox("Región de Mercado:", ["eu", "us", "uk", "au"], index=0)
 bankroll = st.sidebar.number_input("Capital Total ($ Bankroll):", value=1000.0, step=100.0)
-kelly_fraction = st.sidebar.slider("Fracción de Kelly (Riesgo):", 0.05, 0.50, 0.25, step=0.05)
+kelly_fraction = st.sidebar.slider("Fracción de Kelly:", 0.05, 0.50, 0.25, step=0.05)
 
 @st.cache_data(ttl=300)
 def fetch_data(key, reg):
@@ -88,21 +86,21 @@ def fetch_data(key, reg):
     except: return None
 
 # ==========================================
-# 3. INTERFAZ DE USUARIO E INFORMES
+# 3. INTERFAZ Y RENDERIZADO
 # ==========================================
 
 st.title("⚡ OddsDeconstruct AI — Quant & Institutional Engine")
 
 if not api_key:
-    st.info("👈 Por favor ingresa tu API Key en la barra lateral para sincronizar el mercado en vivo.")
+    st.info("👈 Ingresa tu API Key en el menú lateral.")
 else:
     raw_data = fetch_data(api_key, region)
     if not raw_data or not isinstance(raw_data, list):
-        st.error("Error al conectar con la API. Verifica tu clave o el límite de consultas.")
+        st.error("Error de autenticación o datos con la API.")
     else:
         valid_matches = [m for m in raw_data if m.get('bookmakers')]
         if not valid_matches:
-            st.warning("No hay eventos disponibles con líneas de Totales en esta región.")
+            st.warning("No hay mercados de Totales disponibles.")
         else:
             titles = [f"{m.get('sport_title', 'Fútbol')}: {m.get('home_team')} vs {m.get('away_team')}" for m in valid_matches]
             idx = st.selectbox("📌 Selecciona Encuentro:", range(len(titles)), format_func=lambda x: titles[x])
@@ -111,41 +109,38 @@ else:
             home_team = match.get('home_team', 'Local')
             away_team = match.get('away_team', 'Visita')
 
-            # Extracción Dinámica de Mercado Completo
             totals_market = {}
             for bm in match.get('bookmakers', []):
                 for mkt in bm.get('markets', []):
                     if mkt.get('key') == 'totals':
                         for out in mkt.get('outcomes', []):
                             point = float(out.get('point', 0.0))
-                            name = out.get('name') # 'Over' o 'Under'
+                            name = out.get('name')
                             price = float(out.get('price', 0.0))
                             if point not in totals_market: totals_market[point] = {}
                             totals_market[point][name] = price
 
             st.subheader(f"🏟️ {home_team} vs {away_team}")
 
-            # Motor Auto-Inferencia xG con Opción de Control
             c1, c2 = st.columns(2)
             l_h = c1.slider(f"xG Estimado {home_team}:", 0.2, 4.0, 1.35, 0.05)
             l_a = c2.slider(f"xG Estimado {away_team}:", 0.2, 4.0, 1.15, 0.05)
 
-            # Ejecucción Montecarlo (50,000 It.)
             mc = MonteCarloEngine()
             results = mc.run(l_h, l_a)
 
-            # Métricas
+            # Selección de línea para Shin Z
+            main_line = 2.5 if 2.5 in totals_market else (list(totals_market.keys())[0] if totals_market else None)
+            z_score = 0.0
+            if main_line and 'Over' in totals_market[main_line] and 'Under' in totals_market[main_line]:
+                _, z_score = ShinEngine.deoverround([totals_market[main_line]['Over'], totals_market[main_line]['Under']])
+
             m1, m2, m3 = st.columns(3)
             m1.metric("Total Goles Esperados (xG)", f"{l_h + l_a:.2f}")
             m2.metric("Media Simulada (Montecarlo)", f"{np.mean(results['totals']):.2f}")
-            
-            # Cálculo de Shin en línea principal (2.5)
-            z_score = 0.0
-            if 2.5 in totals_market and 'Over' in totals_market[2.5] and 'Under' in totals_market[2.5]:
-                _, z_score = ShinEngine.deoverround([totals_market[2.5]['Over'], totals_market[2.5]['Under']])
-            m3.metric("Sesgo Información Casa (Shin Z)", f"{z_score*100:.2f}%")
+            m3.metric(f"Información Oculta Shin Z ({main_line if main_line else 'N/A'})", f"{z_score*100:.2f}%")
 
-            # Construcción de Tabla Multimercado Dinámica
+            # Matriz Multimercado con soporte para Líneas Asiáticas (Push)
             rows = []
             for point in sorted(totals_market.keys()):
                 prices = totals_market[point]
@@ -153,57 +148,66 @@ else:
                     o_price = prices['Over']
                     u_price = prices['Under']
                     
-                    # Probas Montecarlo
-                    p_o_real = results['get_prob_over'](point)
-                    p_u_real = results['get_prob_under'](point)
+                    p_o = results['p_over'](point)
+                    p_u = results['p_under'](point)
+                    p_push = results['p_exact'](point) if point.is_integer() else 0.0
                     
-                    # Evaluación Over
-                    ev_o = (p_o_real * o_price) - 1.0
-                    k_o = max(0.0, (( (o_price - 1.0) * p_o_real - (1.0 - p_o_real) ) / (o_price - 1.0)) * kelly_fraction)
+                    # Cálculo de EV ajustado por Devolución (Push)
+                    ev_o = (p_o * o_price + p_push) - 1.0
+                    ev_u = (p_u * u_price + p_push) - 1.0
                     
+                    # Criterio Kelly para apuestas con tasa de devolución
+                    p_effective_o = p_o / (1.0 - p_push) if p_push < 1.0 else 0.0
+                    b_o = o_price - 1.0
+                    k_o_full = (b_o * p_effective_o - (1.0 - p_effective_o)) / b_o if b_o > 0 else 0
+                    k_o = max(0.0, k_o_full * kelly_fraction) if ev_o > 0 else 0.0
+
+                    p_effective_u = p_u / (1.0 - p_push) if p_push < 1.0 else 0.0
+                    b_u = u_price - 1.0
+                    k_u_full = (b_u * p_effective_u - (1.0 - p_effective_u)) / b_u if b_u > 0 else 0
+                    k_u = max(0.0, k_u_full * kelly_fraction) if ev_u > 0 else 0.0
+
                     rows.append({
-                        "Mercado": f"Over {point}", "Cuota Casa": f"{o_price:.2f}",
-                        "Prob. Real IA": f"{p_o_real*100:.1f}%", "EV (+/-)": f"{ev_o*100:+.2f}%",
-                        "Kelly Stake ($)": f"${k_o * bankroll:.2f}",
-                        "Diagnóstico": "🔥 VALOR (+EV)" if ev_o > 0.05 else ("⚠️ TRAMPA" if ev_o < -0.10 else "NEUTRO")
+                        "Mercado": f"Over {point}", "Cuota": f"{o_price:.2f}",
+                        "Prob. Win": f"{p_o*100:.1f}%", "Push": f"{p_push*100:.1f}%",
+                        "EV (+/-)": f"{ev_o*100:+.2f}%", "Stake ($)": f"${k_o * bankroll:.2f}",
+                        "Diagnóstico": "🔥 VALOR (+EV)" if ev_o > 0.03 else ("⚠️ TRAMPA" if ev_o < -0.08 else "NEUTRO")
                     })
                     
-                    # Evaluación Under
-                    ev_u = (p_u_real * u_price) - 1.0
-                    k_u = max(0.0, (( (u_price - 1.0) * p_u_real - (1.0 - p_u_real) ) / (u_price - 1.0)) * kelly_fraction)
-                    
                     rows.append({
-                        "Mercado": f"Under {point}", "Cuota Casa": f"{u_price:.2f}",
-                        "Prob. Real IA": f"{p_u_real*100:.1f}%", "EV (+/-)": f"{ev_u*100:+.2f}%",
-                        "Kelly Stake ($)": f"${k_u * bankroll:.2f}",
-                        "Diagnóstico": "🔥 VALOR (+EV)" if ev_u > 0.05 else ("⚠️ TRAMPA" if ev_u < -0.10 else "NEUTRO")
+                        "Mercado": f"Under {point}", "Cuota": f"{u_price:.2f}",
+                        "Prob. Win": f"{p_u*100:.1f}%", "Push": f"{p_push*100:.1f}%",
+                        "EV (+/-)": f"{ev_u*100:+.2f}%", "Stake ($)": f"${k_u * bankroll:.2f}",
+                        "Diagnóstico": "🔥 VALOR (+EV)" if ev_u > 0.03 else ("⚠️ TRAMPA" if ev_u < -0.08 else "NEUTRO")
                     })
 
-            st.subheader("📋 Matriz Multimercado en Tiempo Real")
+            st.subheader("📋 Matriz Multimercado Dinámica")
             st.dataframe(pd.DataFrame(rows), use_container_width=True)
 
-            # Gráficos de Análisis Avanzado
             st.subheader("📈 Análisis Gráfico Cuantitativo")
             g1, g2 = st.columns(2)
 
             with g1:
-                fig, ax = plt.subplots(figsize=(5, 3.5))
+                fig, ax = plt.subplots(figsize=(5, 3.8))
                 fig.patch.set_facecolor('#0b0f19')
                 ax.set_facecolor('#0b0f19')
-                ax.hist(results['totals'], bins=np.arange(0, 9)-0.5, rwidth=0.8, color='#06b6d4', edgecolor='#1e293b')
-                ax.set_title("Distribución Frecuencia Goles (50k It.)", color="white", fontsize=9)
+                counts, bins, patches = ax.hist(results['totals'], bins=np.arange(0, 9)-0.5, rwidth=0.85, color='#06b6d4', edgecolor='#1e293b')
+                ax.set_title("Distribución de Frecuencia de Goles", color="white", fontsize=10, pad=12)
                 ax.tick_params(colors='white')
+                ax.grid(axis='y', linestyle='--', alpha=0.2)
                 st.pyplot(fig)
 
             with g2:
-                fig2, ax2 = plt.subplots(figsize=(5, 3.5))
+                fig2, ax2 = plt.subplots(figsize=(5, 3.8))
                 fig2.patch.set_facecolor('#0b0f19')
                 ax2.set_facecolor('#0b0f19')
+                
+                # Renderizado con contraste adaptativo automático
                 sns.heatmap(results['matrix'], annot=True, fmt=".1f", cmap="mako", cbar=False, ax=ax2,
-                            annot_kws={"size": 7, "color": "white"})
-                ax2.set_title("Marcadores Exactos Probables (%)", color="white", fontsize=9)
-                ax2.set_xlabel(f"Goles {away_team}", color="white", fontsize=8)
-                ax2.set_ylabel(f"Goles {home_team}", color="white", fontsize=8)
+                            annot_kws={"size": 8})
+                
+                ax2.set_title("Marcadores Exactos Probables (%)", color="white", fontsize=10, pad=12)
+                ax2.set_xlabel(f"Goles {away_team}", color="white", fontsize=9)
+                ax2.set_ylabel(f"Goles {home_team}", color="white", fontsize=9)
                 ax2.tick_params(colors='white')
                 st.pyplot(fig2)
-            
