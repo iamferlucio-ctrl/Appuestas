@@ -22,16 +22,15 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ==========================================
-# 1. MOTOR MATEMÁTICO MULTIMERCADO
+# 1. MOTOR MATEMÁTICO CUANTITATIVO
 # ==========================================
 
 class ShinEngine:
     @staticmethod
     def deoverround(odds_list):
-        odds = np.array(odds_list, dtype=float)
-        odds = odds[odds > 1.0]
+        odds = np.array([o for o in odds_list if o > 1.0], dtype=float)
         if len(odds) < 2:
-            return np.ones(len(odds)) / len(odds), 0.0
+            return np.ones(len(odds)) / max(1, len(odds)), 0.0
         
         recip_sum = np.sum(1.0 / odds)
         def shin_obj(z):
@@ -55,9 +54,7 @@ class InstitutionalMonteCarlo:
         sim_h = np.random.negative_binomial(n_h, p_h, self.simulations)
         sim_a = np.random.negative_binomial(n_a, p_a, self.simulations)
         totals = sim_h + sim_a
-        diff = sim_h - sim_a
 
-        # Matriz 6x6
         matrix = np.zeros((6, 6))
         for h, a in zip(sim_h, sim_a):
             if h < 6 and a < 6:
@@ -65,26 +62,17 @@ class InstitutionalMonteCarlo:
         matrix = (matrix / self.simulations) * 100
 
         return {
-            'totals': totals, 'diff': diff, 'matrix': matrix,
-            # Probabilidades 1X2
+            'totals': totals, 'matrix': matrix,
             'p_home': np.mean(sim_h > sim_a),
             'p_draw': np.mean(sim_h == sim_a),
             'p_away': np.mean(sim_h < sim_a),
-            # BTTS
-            'p_btts_yes': np.mean((sim_h > 0) & (sim_a > 0)),
-            'p_btts_no': np.mean((sim_h == 0) | (sim_a == 0)),
-            # Totales
             'p_over': lambda line: np.mean(totals > line),
             'p_under': lambda line: np.mean(totals < line),
-            'p_exact_total': lambda line: np.mean(totals == line),
-            # Hándicap Asiático
-            'p_ah_home': lambda hcap: np.mean(diff + hcap > 0),
-            'p_ah_away': lambda hcap: np.mean(diff + hcap < 0),
-            'p_ah_push': lambda hcap: np.mean(diff + hcap == 0)
+            'p_exact_total': lambda line: np.mean(totals == line)
         }
 
 # ==========================================
-# 2. CONFIGURACIÓN Y API MULTI-MERCADO
+# 2. CONFIGURACIÓN Y CONEXIÓN ROBUSTA API
 # ==========================================
 
 st.sidebar.header("🔑 Control Cuantitativo")
@@ -94,13 +82,18 @@ bankroll = st.sidebar.number_input("Capital Bankroll ($):", value=1000.0, step=1
 kelly_fraction = st.sidebar.slider("Fracción Kelly (Riesgo):", 0.05, 0.50, 0.25, step=0.05)
 
 @st.cache_data(ttl=300)
-def fetch_all_markets(key, reg):
-    if not key: return None
-    url = f"https://api.the-odds-api.com/v4/sports/soccer/odds/?apiKey={key}&regions={reg}&markets=h2h,totals,btts,spreads&oddsFormat=decimal"
+def fetch_data_robust(key, reg):
+    if not key: return None, "Falta API Key"
+    # Endpoints soportados: h2h, totals, spreads
+    url = f"https://api.the-odds-api.com/v4/sports/soccer/odds/?apiKey={key}&regions={reg}&markets=h2h,totals,spreads&oddsFormat=decimal"
     try:
         r = requests.get(url, timeout=10)
-        return r.json() if r.status_code == 200 else None
-    except: return None
+        if r.status_code == 200:
+            return r.json(), None
+        else:
+            return None, f"HTTP Error {r.status_code}: {r.text}"
+    except Exception as e:
+        return None, str(e)
 
 # ==========================================
 # 3. INTERFAZ E INFORMES DE ALTO NIVEL
@@ -109,15 +102,15 @@ def fetch_all_markets(key, reg):
 st.title("⚡ OddsDeconstruct AI — Quant & Institutional Platform")
 
 if not api_key:
-    st.info("👈 Ingresa tu API Key en la barra lateral para sincronizar los mercados globales.")
+    st.info("👈 Ingresa tu API Key en la barra lateral para sincronizar los mercados.")
 else:
-    raw_data = fetch_all_markets(api_key, region)
-    if not raw_data or not isinstance(raw_data, list):
-        st.error("Error al conectar con el feed de cuotas multimercado.")
+    raw_data, err_msg = fetch_data_robust(api_key, region)
+    if raw_data is None:
+        st.error(f"Error al conectar con la API: {err_msg}")
     else:
         valid_matches = [m for m in raw_data if m.get('bookmakers')]
         if not valid_matches:
-            st.warning("No hay encuentros con datos multimercado activos.")
+            st.warning("No hay encuentros activos con cuotas para la región seleccionada.")
         else:
             titles = [f"{m.get('sport_title', 'Fútbol')}: {m.get('home_team')} vs {m.get('away_team')}" for m in valid_matches]
             idx = st.selectbox("📌 Selecciona Evento Deportivo:", range(len(titles)), format_func=lambda x: titles[x])
@@ -126,8 +119,8 @@ else:
             home_team = match.get('home_team', 'Local')
             away_team = match.get('away_team', 'Visita')
 
-            # Extracción Multimercado
-            mkt_data = {'h2h': {}, 'totals': {}, 'btts': {}, 'spreads': {}}
+            # Extracción estructurada de mercados
+            mkt_data = {'h2h': {}, 'totals': {}, 'spreads': {}}
             for bm in match.get('bookmakers', []):
                 for mkt in bm.get('markets', []):
                     k = mkt.get('key')
@@ -151,20 +144,21 @@ else:
             l_h = c1.slider(f"xG Esperado {home_team}:", 0.2, 4.0, 1.35, 0.05)
             l_a = c2.slider(f"xG Esperado {away_team}:", 0.2, 4.0, 1.15, 0.05)
 
-            # Simulación Montecarlo 50k
+            # Simulación Montecarlo 50,000 iteraciones
             mc = InstitutionalMonteCarlo()
             results = mc.run(l_h, l_a)
 
             # Métricas
             h2h_odds = [mkt_data['h2h'].get(home_team, 0), mkt_data['h2h'].get('Draw', 0), mkt_data['h2h'].get(away_team, 0)]
-            _, z_h2h = ShinEngine.deoverround([o for o in h2h_odds if o > 1.0])
+            _, z_h2h = ShinEngine.deoverround(h2h_odds)
 
             m1, m2, m3 = st.columns(3)
             m1.metric("Goles Totales Esperados", f"{l_h + l_a:.2f}")
             m2.metric("Sesgo Información Shin Z (1X2)", f"{z_h2h*100:.2f}%")
-            m3.metric("Marcador Más Probable", f"{np.unravel_index(np.argmax(results['matrix']), results['matrix'].shape)}")
+            max_idx = np.unravel_index(np.argmax(results['matrix']), results['matrix'].shape)
+            m3.metric("Marcador Más Probable", f"{max_idx[0]} - {max_idx[1]}")
 
-            # Construcción de Opciones Multimercado
+            # Evaluaciones
             eval_rows = []
             
             def add_eval(mkt_name, odd, p_win, p_push=0.0):
@@ -187,16 +181,7 @@ else:
             if 'Draw' in mkt_data['h2h']: add_eval("Empate", mkt_data['h2h']['Draw'], results['p_draw'])
             if away_team in mkt_data['h2h']: add_eval(f"Ganador {away_team}", mkt_data['h2h'][away_team], results['p_away'])
 
-            # Evaluaciones Doble Oportunidad
-            if 'Draw' in mkt_data['h2h']:
-                add_eval(f"1X ({home_team} o Empate)", mkt_data['h2h'].get('1X', 1.0), results['p_home'] + results['p_draw'])
-                add_eval(f"X2 (Empate o {away_team})", mkt_data['h2h'].get('X2', 1.0), results['p_away'] + results['p_draw'])
-
-            # Evaluaciones BTTS
-            if 'Yes' in mkt_data['btts']: add_eval("Ambos Marcan: SÍ", mkt_data['btts']['Yes'], results['p_btts_yes'])
-            if 'No' in mkt_data['btts']: add_eval("Ambos Marcan: NO", mkt_data['btts']['No'], results['p_btts_no'])
-
-            # Evaluaciones Totales
+            # Evaluaciones Totales (Over/Under)
             for pt, prices in mkt_data['totals'].items():
                 p_push = results['p_exact_total'](pt) if pt.is_integer() else 0.0
                 if 'Over' in prices: add_eval(f"Over {pt}", prices['Over'], results['p_over'](pt), p_push)
@@ -204,26 +189,24 @@ else:
 
             df_eval = pd.DataFrame(eval_rows)
 
-            # INFORME DE INTELIGENCIA CUANTITATIVA (Interpretación Ejecutiva)
+            # Informe
             st.subheader("🧠 Informe de Inteligencia Cuantitativa")
-            
             value_bets = [r for r in eval_rows if "🔥" in r["Diagnóstico"]]
             traps = [r for r in eval_rows if "⚠️" in r["Diagnóstico"]]
             
-            report_html = f"""
+            st.markdown(f"""
             <div class="report-box">
                 <b>RESUMEN EJECUTIVO DE MERCADO:</b><br>
-                * <b>Eficiencia del Mercado (Shin Z):</b> El margen de información oculta detectado en 1X2 es de <b>{z_h2h*100:.2f}%</b>. {"Alta eficiencia institucional." if z_h2h < 0.03 else "Inconsistencias detectadas en el Overround de la casa."}<br>
-                * <b>Oportunidades de Valor (+EV):</b> Se detectaron <b>{len(value_bets)}</b> selecciones con ventaja estadística sobre la casa de apuestas.<br>
-                * <b>Sesgo de Mercado:</b> La casa muestra una sobreprotección en selecciones populares. Hay <b>{len(traps)}</b> mercados catalogados como trampas de valor negativo.
+                * <b>Eficiencia del Mercado (Shin Z):</b> El margen de información oculta detectado en 1X2 es de <b>{z_h2h*100:.2f}%</b>. {"Alta eficiencia de mercado." if z_h2h < 0.03 else "Desviaciones detectadas en el Overround de la casa."}<br>
+                * <b>Oportunidades de Valor (+EV):</b> Se detectaron <b>{len(value_bets)}</b> selecciones con ventaja estadística sobre la casa.<br>
+                * <b>Mercados Riesgosos:</b> Se identificaron <b>{len(traps)}</b> selecciones con valor esperado negativo.
             </div>
-            """
-            st.markdown(report_html, unsafe_allow_html=True)
+            """, unsafe_allow_html=True)
 
             st.subheader("📋 Matriz Multimercado Institucional")
             st.dataframe(df_eval, use_container_width=True)
 
-            # Visualizaciones
+            # Gráficos
             st.subheader("📈 Mapa de Calor & Distribución de Marcadores")
             g1, g2 = st.columns(2)
 
