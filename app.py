@@ -1,3 +1,4 @@
+import os
 import streamlit as st
 import numpy as np
 import pandas as pd
@@ -72,11 +73,20 @@ class InstitutionalMonteCarlo:
         }
 
 # ==========================================
-# 2. CONFIGURACIÓN Y CONEXIÓN ROBUSTA API
+# 2. CONFIGURACIÓN Y PERSISTENCIA DE API KEY
 # ==========================================
 
 st.sidebar.header("🔑 Control Cuantitativo")
-api_key = st.sidebar.text_input("API Key (The-Odds-API):", value="", type="password")
+
+# Detección automática de la API Key desde variables de entorno (.Renviron / Secrets)
+env_api_key = os.getenv("ODDS_API_KEY") or os.getenv("API_KEY") or ""
+
+if env_api_key:
+    api_key = env_api_key
+    st.sidebar.success("✅ API Key cargada automáticamente.")
+else:
+    api_key = st.sidebar.text_input("API Key (The-Odds-API):", value="", type="password")
+
 region = st.sidebar.selectbox("Región Mercado:", ["eu", "us", "uk", "au"], index=0)
 bankroll = st.sidebar.number_input("Capital Bankroll ($):", value=1000.0, step=100.0)
 kelly_fraction = st.sidebar.slider("Fracción Kelly (Riesgo):", 0.05, 0.50, 0.25, step=0.05)
@@ -84,7 +94,6 @@ kelly_fraction = st.sidebar.slider("Fracción Kelly (Riesgo):", 0.05, 0.50, 0.25
 @st.cache_data(ttl=300)
 def fetch_data_robust(key, reg):
     if not key: return None, "Falta API Key"
-    # Endpoints soportados: h2h, totals, spreads
     url = f"https://api.the-odds-api.com/v4/sports/soccer/odds/?apiKey={key}&regions={reg}&markets=h2h,totals,spreads&oddsFormat=decimal"
     try:
         r = requests.get(url, timeout=10)
@@ -148,7 +157,7 @@ else:
             mc = InstitutionalMonteCarlo()
             results = mc.run(l_h, l_a)
 
-            # Métricas
+            # Métricas Principales
             h2h_odds = [mkt_data['h2h'].get(home_team, 0), mkt_data['h2h'].get('Draw', 0), mkt_data['h2h'].get(away_team, 0)]
             _, z_h2h = ShinEngine.deoverround(h2h_odds)
 
@@ -156,24 +165,36 @@ else:
             m1.metric("Goles Totales Esperados", f"{l_h + l_a:.2f}")
             m2.metric("Sesgo Información Shin Z (1X2)", f"{z_h2h*100:.2f}%")
             max_idx = np.unravel_index(np.argmax(results['matrix']), results['matrix'].shape)
-            m3.metric("Marcador Más Probable", f"{max_idx[0]} - {max_idx[1]}")
+            m3.metric("Marcador Más Probable (Moda)", f"{max_idx[0]} - {max_idx[1]}")
 
-            # Evaluaciones
+            # EVALUACIÓN ESTRICTA DE VALOR (+EV)
             eval_rows = []
             
             def add_eval(mkt_name, odd, p_win, p_push=0.0):
                 if odd <= 1.0: return
+                # Cálculo de Esperanza Matemática (EV)
                 ev = (p_win * odd + p_push) - 1.0
                 p_eff = p_win / (1.0 - p_push) if p_push < 1.0 else 0.0
                 b = odd - 1.0
                 k_full = (b * p_eff - (1.0 - p_eff)) / b if b > 0 else 0.0
                 stake = max(0.0, k_full * kelly_fraction * bankroll) if ev > 0.0 else 0.0
                 
+                # Regla Estricta: Solo es VALOR si EV > 0 (independiente de la probabilidad pura)
+                if ev >= 0.03:
+                    diag = "🔥 VALOR (+EV)"
+                elif ev <= -0.05:
+                    diag = "⚠️ TRAMPA (-EV)"
+                else:
+                    diag = "NEUTRO"
+
                 eval_rows.append({
-                    "Mercado": mkt_name, "Cuota Casa": f"{odd:.2f}",
-                    "Prob. Modelo": f"{p_win*100:.1f}%", "Push": f"{p_push*100:.1f}%",
-                    "EV (+/-)": f"{ev*100:+.2f}%", "Stake Sugerido": f"${stake:.2f}",
-                    "Diagnóstico": "🔥 VALOR (+EV)" if ev > 0.04 else ("⚠️ TRAMPA" if ev < -0.08 else "NEUTRO")
+                    "Mercado": mkt_name, 
+                    "Cuota Casa": f"{odd:.2f}",
+                    "Prob. Modelo": f"{p_win*100:.1f}%", 
+                    "Push": f"{p_push*100:.1f}%",
+                    "EV (+/-)": f"{ev*100:+.2f}%", 
+                    "Stake Sugerido": f"${stake:.2f}",
+                    "Diagnóstico": diag
                 })
 
             # Evaluaciones 1X2
@@ -189,17 +210,18 @@ else:
 
             df_eval = pd.DataFrame(eval_rows)
 
-            # Informe
+            # Informe de Inteligencia
             st.subheader("🧠 Informe de Inteligencia Cuantitativa")
             value_bets = [r for r in eval_rows if "🔥" in r["Diagnóstico"]]
             traps = [r for r in eval_rows if "⚠️" in r["Diagnóstico"]]
             
             st.markdown(f"""
             <div class="report-box">
-                <b>RESUMEN EJECUTIVO DE MERCADO:</b><br>
-                * <b>Eficiencia del Mercado (Shin Z):</b> El margen de información oculta detectado en 1X2 es de <b>{z_h2h*100:.2f}%</b>. {"Alta eficiencia de mercado." if z_h2h < 0.03 else "Desviaciones detectadas en el Overround de la casa."}<br>
-                * <b>Oportunidades de Valor (+EV):</b> Se detectaron <b>{len(value_bets)}</b> selecciones con ventaja estadística sobre la casa.<br>
-                * <b>Mercados Riesgosos:</b> Se identificaron <b>{len(traps)}</b> selecciones con valor esperado negativo.
+                <b>AUDITORÍA DE MERCADO Y PREDICCIÓN:</b><br>
+                * <b>Resultado Más Probable:</b> {max_idx[0]} - {max_idx[1]} (Basado en la moda de las simulations de Montecarlo).<br>
+                * <b>Eficiencia del Mercado (Shin Z):</b> El margen de información oculta detectado es de <b>{z_h2h*100:.2f}%</b>.<br>
+                * <b>Oportunidades de Valor (+EV Real):</b> Se detectaron <b>{len(value_bets)}</b> selecciones donde la cuota ofrecida por la casa supera la probabilidad real del modelo.<br>
+                * <b>Nota del Auditor:</b> Una apuesta con la probabilidad más alta no necesariamente es la mejor opción si la cuota está mal pagada por la casa. Confía en las selecciones marcadas con <b>+EV</b>.
             </div>
             """, unsafe_allow_html=True)
 
